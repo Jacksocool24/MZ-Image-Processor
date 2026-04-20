@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
+from PIL import Image
 
 from Picture import run_pipeline
 
@@ -24,6 +25,8 @@ BATCH_MAX_WORKERS_CAP = 4
 # 示意图列：长边高清采样后以同尺寸显示；ZIP 仍为全尺寸成品（Cover 由 Picture.py，与此无关）
 PREVIEW_ENCODE_HEIGHT_PX = 300  # resize_bgr_fixed_height 默认
 PREVIEW_JPEG_QUALITY = 95
+# 系统成品 ZIP 内 JPEG：元数据锁定 100 DPI（与 pipeline dpi 一致）
+OUTPUT_JPEG_DPI = (100, 100)
 # 仅加工后预览孪生容器（不写 ZIP）
 PROCESSED_PREVIEW_CANVAS_PX = 400
 PROCESSED_PREVIEW_CONTENT_LONG_EDGE_PX = 330
@@ -96,6 +99,20 @@ def to_bgr(file_bytes: bytes) -> np.ndarray:
 
 def bgr_to_rgb_for_streamlit(img_bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+
+def finalize_image_with_dpi(cv2_img_bgr: np.ndarray) -> bytes:
+    """OpenCV BGR → PIL JPEG 字节流，并写入 100 DPI（JFIF/EXIF）。"""
+    img_rgb = cv2.cvtColor(cv2_img_bgr, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(img_rgb)
+    buf = io.BytesIO()
+    pil_img.save(
+        buf,
+        format="JPEG",
+        quality=PREVIEW_JPEG_QUALITY,
+        dpi=OUTPUT_JPEG_DPI,
+    )
+    return buf.getvalue()
 
 
 def zebra_preview_ambient_bgr(zebra_row_index: int) -> Tuple[int, int, int]:
@@ -743,16 +760,11 @@ def process_single_image(
         dpi=100,
         perform_ocr=False,
     )
-    ok, encoded = cv2.imencode(
-        ".jpg",
-        result.rendered_image_bgr,
-        [cv2.IMWRITE_JPEG_QUALITY, PREVIEW_JPEG_QUALITY],
-    )
-    if not ok:
-        raise RuntimeError(f"导出失败：{row['demo_name']}")
-
-    # ZIP 与看板源共用同一套成品 JPEG 字节；看板 Base64 仅在批完成后主线程内做 400×400 孪生包装
-    zip_bytes = encoded.tobytes()
+    try:
+        # ZIP 与看板源共用同一套成品 JPEG 字节（100 DPI）；看板 Base64 仅在批完成后主线程内做 400×400 孪生包装
+        zip_bytes = finalize_image_with_dpi(result.rendered_image_bgr)
+    except Exception as exc:
+        raise RuntimeError(f"导出失败：{row['demo_name']}") from exc
     out_name = str(matched_name)
     return out_name, zip_bytes, zip_bytes
 
