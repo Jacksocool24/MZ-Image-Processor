@@ -1,6 +1,6 @@
 import re
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Literal, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -28,6 +28,12 @@ def ocr_size_from_demo_bottom(
 
 
 _WHITE_BGR = (255, 255, 255)
+
+# 马克23：边缘变色探测统一、方图保护、SIFT 0° 否决
+_CONTENT_DIR_PROBE_LONG_EDGE_PX = 400
+_SQUARE_MARGIN_REL_TOL = 0.05  # 横向 vs 竖向变色深度相对差异 < 5% → 方图
+
+ContentDirection = Literal["LANDSCAPE", "PORTRAIT", "SQUARE"]
 
 
 def _rotate_with_white_border(image_bgr: np.ndarray, angle_ccw_deg: float) -> np.ndarray:
@@ -161,6 +167,38 @@ def detect_actual_content_box(
     return left, top, right, bottom
 
 
+def detect_content_direction(
+    image_bgr: np.ndarray,
+    probe_long_edge_px: int = _CONTENT_DIR_PROBE_LONG_EDGE_PX,
+    square_margin_rel_tol: float = _SQUARE_MARGIN_REL_TOL,
+) -> ContentDirection:
+    """
+    与示意图相同的「边缘变色」探测：在缩放后的探测图上取包围盒，用四边向内变色深度判断横/竖/方。
+    方图：左右变色深度之和 (left + w-right) 与上下变色深度之和 (top + h-bottom)
+    相对差异 < square_margin_rel_tol 时判定为方图。
+    否则按内容框宽>高为横，否则竖。
+    """
+    if image_bgr is None or image_bgr.size == 0:
+        return "SQUARE"
+    probe = _resize_long_edge_bgr(image_bgr, probe_long_edge_px)
+    h, w = probe.shape[:2]
+    if h < 3 or w < 3:
+        return "SQUARE"
+    left, top, right, bottom = detect_actual_content_box(probe)
+    if (right - left) * (bottom - top) < max(1, int(0.01 * w * h)):
+        left, top, right, bottom = 0, 0, w, h
+    d_h = float(left + (w - right))
+    d_v = float(top + (h - bottom))
+    mx = max(d_h, d_v, 1.0)
+    if abs(d_h - d_v) / mx < square_margin_rel_tol:
+        return "SQUARE"
+    cw = int(right - left)
+    ch = int(bottom - top)
+    if cw <= 0 or ch <= 0:
+        return "SQUARE"
+    return "LANDSCAPE" if cw > ch else "PORTRAIT"
+
+
 def _probe_box_to_original_rect(
     probe_shape: Tuple[int, int],
     orig_shape: Tuple[int, int],
@@ -236,20 +274,22 @@ def _feature_match_score(
 
 
 def sift_best_rotation_deg(
-    demo_image_bgr: np.ndarray,
-    original_image_bgr: np.ndarray,
+    reference_demo_bgr: np.ndarray,
+    query_original_bgr: np.ndarray,
     match_long_edge_px: int = 800,
+    search_angles: Tuple[int, ...] = (0, 90, 270),
 ) -> Tuple[int, Dict[int, float]]:
     """
-    demo_image_bgr 建议为去掉底色的示意图核心裁剪区；特征匹配前将示意图与原图（各旋转）
-    缩至长边 match_long_edge_px，加速且减少边框干扰。
+    reference_demo_bgr：示意图核心（参照）；query_original_bgr：买家原图（唯一允许被旋转求分的对象）。
+    特征匹配前将参照图与各角度下的原图缩至长边 match_long_edge_px。
     """
-    demo_small = _resize_long_edge_bgr(demo_image_bgr, match_long_edge_px)
+    demo_small = _resize_long_edge_bgr(reference_demo_bgr, match_long_edge_px)
     scores: Dict[int, float] = {}
-    for degree in (0, 90, 180, 270):
-        rotated = rotate_image_cw(original_image_bgr, degree)
+    for degree in search_angles:
+        rotated = rotate_image_cw(query_original_bgr, degree)
         rotated_small = _resize_long_edge_bgr(rotated, match_long_edge_px)
         scores[degree] = _feature_match_score(demo_small, rotated_small)
+
     best_degree = max(scores, key=scores.get)
     return best_degree, scores
 
@@ -279,6 +319,7 @@ def render_cover(
     """
     将 aligned 图像等比放大/缩小至完全覆盖画布，再中心裁剪为 canvas 尺寸（无留白）。
     scale = max(canvas_w/img_w, canvas_h/img_h)，与 contain 的 min 相反。
+    仅使用入参 `image_bgr` 与 `canvas_size_px`，不读取示意图或任何模块级「demo」状态。
     """
     canvas_w, canvas_h = canvas_size_px
     if canvas_w <= 0 or canvas_h <= 0:
@@ -310,42 +351,85 @@ def run_pipeline(
     dpi: int = 100,
     perform_ocr: bool = True,
 ) -> ProcessingResult:
-    """内容先纠正（SIFT）→ 物理强匹配画布英寸横竖；无 XOR，不以原图未纠偏尺寸参与判定。"""
+    """
+    马克24：原图仅用 shape 横竖方判定；示意图用边缘探测；SIFT 弱辅助 + 0° 绝对否决；画布仅对示意图方向适配。
+    第一参为示意图（仅参照）；第二参为原图 product_bgr（成品像素唯一来源）。旋转与 render_cover 严禁使用示意图及其派生图。
+    """
+    schematic_bgr = demo_image_bgr
+    product_bgr = original_image_bgr
+
     if perform_ocr:
-        raw_text, parsed_size = ocr_size_from_demo_bottom(demo_image_bgr, reader=reader)
+        raw_text, parsed_size = ocr_size_from_demo_bottom(schematic_bgr, reader=reader)
     else:
         raw_text, parsed_size = "", None
 
     # 示意图：长边 400 探测 + 边缘向内收缩 → 仅用于 SIFT 参照（去边后的画面核心），不取原图 shape 参与判定
     probe_long_edge_px = 400
-    demo_probe = _resize_long_edge_bgr(demo_image_bgr, probe_long_edge_px)
+    demo_probe = _resize_long_edge_bgr(schematic_bgr, probe_long_edge_px)
     pl, pt, pr, pb = detect_actual_content_box(demo_probe)
     ph, pw = demo_probe.shape[:2]
     if (pr - pl) * (pb - pt) < max(1, int(0.01 * pw * ph)):
         pl, pt, pr, pb = 0, 0, pw, ph
 
-    orig_h, orig_w = demo_image_bgr.shape[:2]
-    L, T, R, B = _probe_box_to_original_rect((ph, pw), (orig_h, orig_w), (pl, pt, pr, pb))
-    demo_for_sift = _safe_crop_demo_core(demo_image_bgr, (L, T, R, B))
+    demo_h0, demo_w0 = schematic_bgr.shape[:2]
+    L, T, R, B = _probe_box_to_original_rect((ph, pw), (demo_h0, demo_w0), (pl, pt, pr, pb))
+    demo_for_sift = _safe_crop_demo_core(schematic_bgr, (L, T, R, B))
 
-    # 马克18·步骤一：SIFT 内容纠偏（无 XOR）—— 0/90/180/270 中选最优，使原图与探测后示意图核心同向
-    best_deg, _scores = sift_best_rotation_deg(demo_for_sift, original_image_bgr)
-    content_aligned = rotate_image_cw(original_image_bgr, best_deg)
+    # 步骤一：双重标准 —— 原图 shape（禁止探测）；示意图边缘探测
+    oh, ow = product_bgr.shape[:2]
+    orig_is_landscape = ow > oh
+    orig_is_portrait = oh > ow
+    orig_is_square = oh == ow
+    demo_type = detect_content_direction(demo_for_sift)
+    if orig_is_square or demo_type == "SQUARE":
+        physics_suggests_90 = False
+    else:
+        demo_is_landscape = demo_type == "LANDSCAPE"
+        physics_suggests_90 = orig_is_landscape != demo_is_landscape
 
-    # 马克18·步骤二：物理强制对齐 —— 纠偏后原图横竖 vs 画布英寸横竖；不一致则顺时针再转 90°
-    # （仅用 content_aligned 的尺寸，禁止用 original_image_bgr.shape 参与判定）
-    ah, aw = content_aligned.shape[:2]
-    aligned_landscape = aw > ah
+    # 步骤二：SIFT [0,90,270]；0° 分数严格等于全局最高则 best_deg=0，否则按马克21阈值 + 物理建议
+    _raw_best_deg, scores = sift_best_rotation_deg(
+        demo_for_sift,
+        product_bgr,
+        search_angles=(0, 90, 270),
+    )
+    score_0 = scores.get(0, 0.0)
+    score_90 = scores.get(90, 0.0)
+    score_270 = scores.get(270, 0.0)
+    max_score = max(scores.values())
+    if score_0 == max_score:
+        best_deg = 0
+    elif not physics_suggests_90:
+        if score_90 > score_0 * 2.0:
+            best_deg = 90
+        elif score_270 > score_0 * 2.0:
+            best_deg = 270
+        else:
+            best_deg = 0
+    else:
+        if score_90 >= score_0 * 0.6:
+            best_deg = 90
+        else:
+            best_deg = 0
+    # 仅旋转买家原图；示意图不得作为 rotate / render 的输入
+    content_aligned = rotate_image_cw(product_bgr, best_deg)
+
+    # 步骤三：最终画布适配（仅示意图探测方向 vs 画布英寸；方图不强行转）
     cw_in, ch_in = parse_inch_wh(canvas_size_token)
-    canvas_landscape = cw_in > ch_in
-    composition_need_90 = aligned_landscape != canvas_landscape
+    canvas_is_landscape = cw_in > ch_in
+    if demo_type == "SQUARE":
+        needs_final_90 = False
+    elif demo_type == "LANDSCAPE":
+        needs_final_90 = not canvas_is_landscape
+    else:
+        needs_final_90 = canvas_is_landscape
 
-    if composition_need_90:
+    if needs_final_90:
         final_aligned = rotate_image_cw(content_aligned, 90)
     else:
         final_aligned = content_aligned
 
-    total_deg = (best_deg + (90 if composition_need_90 else 0)) % 360
+    total_deg = (best_deg + (90 if needs_final_90 else 0)) % 360
 
     # 与画布同向后 cover：撑满画布比例并中心裁剪，无白边
     canvas_w, canvas_h = inch_token_to_pixels(canvas_size_token, dpi=dpi)
@@ -355,10 +439,10 @@ def run_pipeline(
         ocr_raw_text=raw_text,
         ocr_size_token=parsed_size,
         content_rotation_deg=best_deg,
-        production_rotation_deg=90 if composition_need_90 else 0,
+        production_rotation_deg=90 if needs_final_90 else 0,
         total_rotation_deg=total_deg,
         needs_align=best_deg != 0,
-        needs_physical_rotate=composition_need_90,
+        needs_physical_rotate=needs_final_90,
         canvas_size_px=(canvas_w, canvas_h),
         rendered_image_bgr=rendered,
     )

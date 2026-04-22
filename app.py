@@ -751,6 +751,13 @@ def process_single_image(
     if not matched_name or not matched_bytes:
         raise ValueError(f"{row['demo_name']} 未找到匹配原图。")
 
+    demo_bytes = row.get("demo_bytes")
+    if demo_bytes is not None and matched_bytes == demo_bytes:
+        raise ValueError(
+            f"{row['demo_name']}：匹配到的原图字节与示意图完全相同，成品会变成示意图；"
+            "请检查原图包是否误传了与示意图相同的文件。"
+        )
+
     demo_bgr = to_bgr(row["demo_bytes"])
     original_bgr = to_bgr(matched_bytes)
     result = run_pipeline(
