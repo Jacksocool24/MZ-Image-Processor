@@ -1,4 +1,5 @@
 import base64
+import gc
 import html
 import io
 import os
@@ -18,8 +19,8 @@ from Picture import run_pipeline
 
 st.set_page_config(page_title="一键改图系统", layout="wide")
 
-# 马克18：批量并行上限强制为 4（不按 CPU 减半）
-BATCH_MAX_WORKERS_CAP = 4
+# 马克25：云端 OOM 风险控制——批量并行上限下调至 2，降低瞬时内存峰值
+BATCH_MAX_WORKERS_CAP = 2
 
 # 看板：加工后预览物理 400×400、画芯长边 330（Base64）；孪生底按 demo_rows 行序斑马线 A/B；前端 200×200
 # 示意图列：长边高清采样后以同尺寸显示；ZIP 仍为全尺寸成品（Cover 由 Picture.py，与此无关）
@@ -790,7 +791,7 @@ def run_batch_and_build_zip(
     """
     全量揭幕：循环内仅更新 batch_status / batch_progress，不刷新表格、不逐行写预览。
     ZIP 构建完成后，一次性将缩略图与「✅/❌」写回 demo_rows，再同步 matched_df 并可选刷新 table_slot。
-    并行数 = min(批次数, BATCH_MAX_WORKERS_CAP=4)。
+    并行数 = min(批次数, BATCH_MAX_WORKERS_CAP=2)。
     返回：(zip_bytes, success_count, fail_count, total_count)
     """
     rows = [r for r in st.session_state.demo_rows if r.get("match_status", "").startswith("✅")]
@@ -847,6 +848,9 @@ def run_batch_and_build_zip(
                 fail_count += 1
                 err = str(exc)[:180]
                 pending_by_uid[uid] = (None, f"❌ {err}")
+            finally:
+                # 云端批量处理后主动触发 GC，缓解内存占用累积导致的 OOM
+                gc.collect()
 
     progress_slot.progress(1.0, text="写入 ZIP…")
     with zipfile.ZipFile(memory_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:

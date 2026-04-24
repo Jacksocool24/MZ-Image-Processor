@@ -281,13 +281,14 @@ def sift_best_rotation_deg(
 ) -> Tuple[int, Dict[int, float]]:
     """
     reference_demo_bgr：示意图核心（参照）；query_original_bgr：买家原图（唯一允许被旋转求分的对象）。
-    特征匹配前将参照图与各角度下的原图缩至长边 match_long_edge_px。
+    特征匹配前先将参照图与原图都缩至长边 match_long_edge_px；
+    角度探测仅在小图副本上旋转与匹配，降低内存与 CPU 峰值。
     """
     demo_small = _resize_long_edge_bgr(reference_demo_bgr, match_long_edge_px)
+    query_small_base = _resize_long_edge_bgr(query_original_bgr, match_long_edge_px)
     scores: Dict[int, float] = {}
     for degree in search_angles:
-        rotated = rotate_image_cw(query_original_bgr, degree)
-        rotated_small = _resize_long_edge_bgr(rotated, match_long_edge_px)
+        rotated_small = rotate_image_cw(query_small_base, degree)
         scores[degree] = _feature_match_score(demo_small, rotated_small)
 
     best_degree = max(scores, key=scores.get)
